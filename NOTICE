@@ -1,0 +1,19 @@
+CINDERmVM
+Copyright 2026 Corey Jacobs
+
+Current license: PolyForm Noncommercial License 1.0.0
+Commercial licensing: Corey Jacobs <coresynth@gmail.com>
+
+This source derives from the author's Cindermote project. The original private
+repository and its Git history are not included in this source-only release.
+
+Third-party dependencies retain their own licenses and are not relicensed here.
+Firecracker and jailer are licensed under Apache License 2.0:
+https://github.com/firecracker-microvm/firecracker/blob/main/LICENSE
+The Linux guest kernel is licensed separately under GPL-2.0-only, with the
+Linux syscall exception as described by the kernel's COPYING file:
+https://docs.kernel.org/process/license-rules.html
+
+Downloaded VMM/kernel binaries, generated root filesystems, and container images
+are not included in this source-only tree. Distributing those artifacts requires
+a separate review of their respective licenses and source obligations.

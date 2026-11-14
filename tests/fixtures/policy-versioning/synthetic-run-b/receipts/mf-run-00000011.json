@@ -1,0 +1,91 @@
+{
+  "identity": {
+    "job_id": "mf-run-00000011",
+    "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "artifact_type": "python-script",
+    "submitted_by": "synthetic-test-only",
+    "received_at": "2000-01-01T00:00:00Z"
+  },
+  "snapshot_policy": {
+    "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "snapshot_verified_by": "test",
+    "policy_version": "cindermote-hotcell-v1.3",
+    "policy_hash": "2bcf44a667a9dc7059b9cf0bf40bb3b981e9953b7f82b55e92d18c3930bb238b"
+  },
+  "isolation": {
+    "mode": "full-root",
+    "namespace_used": true,
+    "seccomp_loaded": true,
+    "cgroups_used": true,
+    "mlock_used": true
+  },
+  "budgets_granted": {},
+  "capabilities": {
+    "requested": [],
+    "granted": [],
+    "denied": []
+  },
+  "telemetry_summary": {},
+  "canaries_touched": {},
+  "destinations_attempted": {},
+  "detector_findings": [
+    {
+      "rule_id": "namespace_escape_attempt",
+      "count": 1,
+      "severity": "CRITICAL"
+    },
+    {
+      "rule_id": "network_exfil_attempt",
+      "count": 1,
+      "severity": "CRITICAL"
+    }
+  ],
+  "gate": {
+    "policy_gate_decision": "DENY",
+    "policy_gate_reason": "known_bad_behavior_detected",
+    "human_gate_override": "none",
+    "final_decision": "DENY",
+    "final_authority": "policy_gate_autonomous",
+    "override_blocked_by_fail_closed": false
+  },
+  "outward_report": {
+    "risk_level": "hostile",
+    "evidence": [
+      {
+        "tap_category": "syscall_class",
+        "rule_id": "namespace_escape_attempt",
+        "count": 1
+      },
+      {
+        "tap_category": "network_flows",
+        "rule_id": "network_exfil_attempt",
+        "count": 1
+      }
+    ],
+    "capabilities_requested": [],
+    "destinations": [],
+    "canaries_tripped": [],
+    "uncertainty": 0.0
+  },
+  "purge": {
+    "method": "test cleanup",
+    "verified_externally": true,
+    "process_group_empty": true,
+    "cgroup_empty": true,
+    "cgroup_removed": true,
+    "job_mount_removed": true,
+    "job_directory_removed": true,
+    "processes_remaining": 0,
+    "remaining_host_resources": []
+  },
+  "telemetry_incomplete": false,
+  "budget_exhausted": false,
+  "residual_uncertainty": 0.0,
+  "observation": {
+    "status": "COMPLETE",
+    "exec_observed": true,
+    "failure_class": null,
+    "diagnostic": ""
+  },
+  "receipt_signature": "018724f85a83a9aa43a56e896e364bfec8d0bff8eabdd033d9c42590fd653fee"
+}
