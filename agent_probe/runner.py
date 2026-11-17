@@ -94,6 +94,8 @@ def _read_target_bytes(target_path: Path | str) -> bytes:
         finally:
             os.close(file_fd)
     except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            raise FileNotFoundError("target path does not exist") from exc
         raise AgentProbeError("target path is unavailable or contains a symlink") from exc
     finally:
         os.close(directory_fd)
