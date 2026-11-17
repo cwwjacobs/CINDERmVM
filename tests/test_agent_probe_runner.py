@@ -3,7 +3,10 @@ from __future__ import annotations
 import copy
 import errno
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from cindermote.agent_probe.broker import AgentProbeBroker
 from cindermote.agent_probe.contract import ModelConfig, verify_envelope
@@ -273,3 +276,75 @@ def test_read_exact_key_refuses_unsafe_key_files(tmp_path: Path) -> None:
     oversized.write_bytes(b" " * 2048 + b"s" * 32)
     oversized.chmod(0o600)
     assert refused(oversized, private=True)
+
+def test_target_intake_reads_only_bounded_regular_files(tmp_path: Path, monkeypatch) -> None:
+    from cindermote.agent_probe.runner import AgentProbeError, _read_target_bytes
+
+    target = tmp_path / "safe.skill"
+    target.write_bytes(b"safe content")
+    assert _read_target_bytes(target) == b"safe content"
+    monkeypatch.chdir(tmp_path)
+    assert _read_target_bytes("safe.skill") == b"safe content"
+
+    target.write_bytes(b"x" * (1024 * 1024))
+    assert len(_read_target_bytes(target)) == 1024 * 1024
+
+    target.write_bytes(b"x" * (1024 * 1024 + 1))
+    with pytest.raises(AgentProbeError, match="one-MiB"):
+        _read_target_bytes(target)
+
+
+def test_target_intake_rejects_symlinks_in_file_and_parent(tmp_path: Path) -> None:
+    from cindermote.agent_probe.runner import AgentProbeError, _read_target_bytes
+
+    directory = tmp_path / "real-parent"
+    directory.mkdir()
+    target = directory / "safe.skill"
+    target.write_bytes(b"private contents must not be read through a link")
+
+    direct_link = tmp_path / "linked.skill"
+    direct_link.symlink_to(target)
+    parent_link = tmp_path / "linked-parent"
+    parent_link.symlink_to(directory, target_is_directory=True)
+
+    for unsafe_path in (direct_link, parent_link / "safe.skill"):
+        with pytest.raises(AgentProbeError):
+            _read_target_bytes(unsafe_path)
+
+
+def test_target_intake_rejects_directories_special_files_and_dotdot(tmp_path: Path) -> None:
+    from cindermote.agent_probe.runner import AgentProbeError, _read_target_bytes
+
+    target = tmp_path / "regular.skill"
+    target.write_bytes(b"safe")
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    for unsafe_path in (tmp_path, fifo, tmp_path / "child" / ".." / "regular.skill"):
+        with pytest.raises(AgentProbeError):
+            _read_target_bytes(unsafe_path)
+
+
+def test_agent_probe_rejects_linked_target_before_runtime(tmp_path: Path) -> None:
+    from cindermote.agent_probe.runner import AgentProbeError
+
+    actual = tmp_path / "actual.skill"
+    actual.write_bytes(b"controlled text")
+    linked = tmp_path / "linked.skill"
+    linked.symlink_to(actual)
+
+    def forbidden_runtime(**_kwargs):
+        pytest.fail("runtime must never start for a linked target")
+
+    with pytest.raises(AgentProbeError):
+        run_agent_probe(
+            linked,
+            model=ModelConfig("openai-compatible", "model", "https://api.example.com/v1/chat/completions"),
+            api_key=bytearray(b"fresh"),
+            observer_key=b"o" * 32,
+            quarantine_public_key=b"p" * 32,
+            quarantine_key_id="a" * 32,
+            quarantine_dir=tmp_path / "quarantine",
+            receipt_dir=tmp_path / "receipts",
+            runtime=forbidden_runtime,
+        )
