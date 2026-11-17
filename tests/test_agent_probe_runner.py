@@ -277,6 +277,7 @@ def test_read_exact_key_refuses_unsafe_key_files(tmp_path: Path) -> None:
     oversized.chmod(0o600)
     assert refused(oversized, private=True)
 
+
 def test_target_intake_reads_only_bounded_regular_files(tmp_path: Path, monkeypatch) -> None:
     from cindermote.agent_probe.runner import AgentProbeError, _read_target_bytes
 
@@ -323,6 +324,9 @@ def test_target_intake_rejects_directories_special_files_and_dotdot(tmp_path: Pa
     for unsafe_path in (tmp_path, fifo, tmp_path / "child" / ".." / "regular.skill"):
         with pytest.raises(AgentProbeError):
             _read_target_bytes(unsafe_path)
+
+    with pytest.raises(FileNotFoundError):
+        _read_target_bytes(tmp_path / "does-not-exist.skill")
 
 
 def test_agent_probe_rejects_linked_target_before_runtime(tmp_path: Path) -> None:
