@@ -52,6 +52,58 @@ class AgentProbeRun:
 
 
 MAX_KEY_FILE_BYTES = 1024
+MAX_TARGET_BYTES = 1024 * 1024
+
+
+def _read_target_bytes(target_path: Path | str) -> bytes:
+    """Read a bounded regular file without following symlinks in any path component."""
+    path = Path(target_path)
+    if ".." in path.parts:
+        raise AgentProbeError("target path may not traverse parent directories")
+    components = [part for part in path.parts if part not in (path.anchor, ".")]
+    if not components:
+        raise AgentProbeError("target must be a regular file")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(path.anchor or ".", flags | os.O_DIRECTORY)
+    except OSError as exc:
+        raise AgentProbeError("target directory is unavailable or unsafe") from exc
+
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(component, flags | os.O_DIRECTORY, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        file_fd = os.open(components[-1], flags | os.O_NONBLOCK, dir_fd=directory_fd)
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise AgentProbeError("target must be a regular file")
+            if metadata.st_size > MAX_TARGET_BYTES:
+                raise AgentProbeError("target exceeds the v0 one-MiB limit")
+            chunks: list[bytes] = []
+            remaining = MAX_TARGET_BYTES + 1
+            while remaining:
+                chunk = os.read(file_fd, min(remaining, 65536))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(file_fd)
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            raise FileNotFoundError("target path does not exist") from exc
+        raise AgentProbeError("target path is unavailable or contains a symlink") from exc
+    finally:
+        os.close(directory_fd)
+
+    target_bytes = b"".join(chunks)
+    if len(target_bytes) > MAX_TARGET_BYTES:
+        raise AgentProbeError("target exceeds the v0 one-MiB limit")
+    return target_bytes
 
 
 def _read_exact_key(path: Path, *, name: str, lengths: set[int], private: bool) -> bytes:
@@ -138,12 +190,7 @@ def run_agent_probe(
 ) -> AgentProbeRun:
     """Run one real Firecracker-only agent probe and persist bounded artifacts."""
 
-    target = Path(target_path).resolve()
-    if not target.is_file() or target.is_symlink():
-        raise FileNotFoundError(target)
-    target_bytes = target.read_bytes()  # Opaque host transport and hashing only.
-    if len(target_bytes) > 1024 * 1024:
-        raise AgentProbeError("target exceeds the v0 one-MiB limit")
+    target_bytes = _read_target_bytes(target_path)  # Opaque host transport and hashing only.
     if not isinstance(api_key, bytearray) or not 1 <= len(api_key) <= 4096:
         raise AgentProbeError("fresh API credential is required as a mutable bytearray")
 
